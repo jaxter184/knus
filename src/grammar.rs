@@ -36,582 +36,11 @@ impl<I: Clone, O, R: Parser<I, O>> ChainChar<I, O> for R {
     }
 }
 
-fn begin_comment<S: Span>(which: char) -> impl Parser<char, (), Error = Error<S>> + Clone {
-    just('/')
-        .map_err(|e: Error<S>| e.with_no_expected())
-        .ignore_then(just(which).ignored())
+pub(crate) fn document<S: Span>() -> impl Parser<char, Document<S>, Error = Error<S>> {
+    just('\u{FEFF}').or_not().ignore_then(nodes()).then_ignore(end()).map(|nodes| Document { nodes })
 }
 
-fn newline<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    just('\r')
-        .or_not()
-        .ignore_then(just('\n'))
-        .or(just('\r')) // Carriage return
-        .or(just('\x0C')) // Form feed
-        .or(just('\x0B')) // Vertical tab
-        .or(just('\u{0085}')) // Next line
-        .or(just('\u{2028}')) // Line separator
-        .or(just('\u{2029}')) // Paragraph separator
-        .ignored()
-        .map_err(|e: Error<S>| e.with_expected_kind("newline"))
-}
-
-fn ws_char<S: Span>() -> impl Parser<char, (), Error = Error<S>> + Clone {
-    filter(|c| {
-        matches!(
-            c,
-            '\t' | ' ' | '\u{00a0}' | '\u{1680}' | '\u{2000}'
-                ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
-        )
-    })
-    .ignored()
-}
-
-fn id_char<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
-    filter(|c| {
-        !matches!(c,
-            '\u{0000}'..='\u{0021}' |
-            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
-            // whitespace, excluding 0x20
-            '\u{00a0}' | '\u{1680}' |
-            '\u{2000}'..='\u{200A}' |
-            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
-            // newline (excluding <= 0x20)
-            '\u{0085}' | '\u{2028}' | '\u{2029}'
-        )
-    })
-    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
-}
-
-fn id_sans_dig<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
-    filter(|c| {
-        !matches!(c,
-            '0'..='9' |
-            '\u{0000}'..='\u{0020}' |
-            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
-            // whitespace, excluding 0x20
-            '\u{00a0}' | '\u{1680}' |
-            '\u{2000}'..='\u{200A}' |
-            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
-            // newline (excluding <= 0x20)
-            '\u{0085}' | '\u{2028}' | '\u{2029}'
-        )
-    })
-    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
-}
-
-fn id_sans_dig_point<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
-    filter(|c| {
-        !matches!(c,
-            '0'..='9' | '.' |
-            '\u{0000}'..='\u{0020}' |
-            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
-            // whitespace, excluding 0x20
-            '\u{00a0}' | '\u{1680}' |
-            '\u{2000}'..='\u{200A}' |
-            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
-            // newline (excluding <= 0x20)
-            '\u{0085}' | '\u{2028}' | '\u{2029}'
-        )
-    })
-    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
-}
-
-fn id_sans_sign_dig_point<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
-    filter(|c| {
-        !matches!(c,
-            '-'| '+' | '0'..='9' |
-            '\u{0000}'..='\u{0020}' |
-            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
-            // whitespace, excluding 0x20
-            '\u{00a0}' | '\u{1680}' |
-            '\u{2000}'..='\u{200A}' |
-            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
-            // newline (excluding <= 0x20)
-            '\u{0085}' | '\u{2028}' | '\u{2029}'
-        )
-    })
-    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
-}
-
-fn ws<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    ws_char()
-        .repeated()
-        .at_least(1)
-        .ignored()
-        .or(ml_comment())
-        .map_err(|e| e.with_expected_kind("whitespace"))
-}
-
-fn comment<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    begin_comment('/')
-        .then(take_until(newline().or(end())))
-        .ignored()
-}
-
-fn ml_comment<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    recursive::<_, _, _, _, Error<S>>(|comment| {
-        choice((
-            comment,
-            none_of('*').ignored(),
-            just('*').then_ignore(none_of('/').rewind()).ignored(),
-        ))
-        .repeated()
-        .ignored()
-        .delimited_by(begin_comment('*'), just("*/"))
-    })
-    .map_err_with_span(|e, span| {
-        if matches!(
-            &e,
-            Error::Unexpected {
-                found: TokenFormat::Eoi,
-                ..
-            }
-        ) && span.length() > 2
-        {
-            e.merge(Error::Unclosed {
-                label: "comment",
-                opened_at: span.at_start(2),
-                opened: "/*".into(),
-                expected_at: span.at_end(),
-                expected: "*/".into(),
-                found: None.into(),
-            })
-        } else {
-            // otherwise opening /* is not matched
-            e
-        }
-    })
-}
-
-fn raw_string<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
-     just('#').repeated().at_least(1).map(|v| v.len())
-        .then_ignore(just('"'))
-        .then_with(|sharp_num| {
-            take_until(just('"').ignore_then(just('#').repeated().exactly(sharp_num).ignored()))
-                .map_err_with_span(move |e: Error<S>, span| {
-                    if matches!(
-                        &e,
-                        Error::Unexpected {
-                            found: TokenFormat::Eoi,
-                            ..
-                        }
-                    ) {
-                        e.merge(Error::Unclosed {
-                            label: "raw string",
-                            opened_at: span.before_start(sharp_num + 2),
-                            opened: TokenFormat::OpenRaw(sharp_num),
-                            expected_at: span.at_end(),
-                            expected: TokenFormat::CloseRaw(sharp_num),
-                            found: None.into(),
-                        })
-                    } else {
-                        e
-                    }
-                })
-        })
-        .map(|(text, ())| text.into_iter().collect::<String>().into())
-}
-
-fn string<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
-    raw_string().or(escaped_string())
-}
-
-fn expected_kind(s: &'static str) -> BTreeSet<TokenFormat> {
-    [TokenFormat::Kind(s)].into_iter().collect()
-}
-
-fn esc_char<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
-    filter_map(|span, c| match c {
-        '"' | '\\' => Ok(c),
-        'b' => Ok('\u{0008}'),
-        'f' => Ok('\u{000C}'),
-        'n' => Ok('\n'),
-        'r' => Ok('\r'),
-        't' => Ok('\t'),
-        's' => Ok(' '),
-        c => Err(Error::Unexpected {
-            label: Some("invalid escape char"),
-            span,
-            found: c.into(),
-            expected: "\"\\bfnrts".chars().map(|c| c.into()).collect(),
-        }),
-    })
-    .or(just('u').ignore_then(
-        filter_map(|span, c: char| {
-            c.is_ascii_hexdigit()
-                .then_some(c)
-                .ok_or_else(|| Error::Unexpected {
-                    label: Some("unexpected character"),
-                    span,
-                    found: c.into(),
-                    expected: expected_kind("hexadecimal digit"),
-                })
-        })
-        .repeated()
-        .at_least(1)
-        .at_most(6)
-        .delimited_by(just('{'), just('}'))
-        .try_map(|hex_chars, span| {
-            let s = hex_chars.into_iter().collect::<String>();
-            let c = u32::from_str_radix(&s, 16)
-                .map_err(|e| e.to_string())
-                .and_then(|n| char::try_from(n).map_err(|e| e.to_string()))
-                .map_err(|e| Error::Message {
-                    label: Some("invalid character code"),
-                    span,
-                    message: e.to_string(),
-                })?;
-            Ok(c)
-        })
-        .recover_with(skip_until(['}', '"', '\\'], |_| '\0')),
-    ))
-}
-
-fn escaped_string<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
-    just('"').ignore_then(
-        choice((
-            filter(|&c| c != '"' && c != '\\'),
-            just('\\').ignore_then(esc_char()),
-            // ws-escape
-            just('\\').then(ws_char().or(newline()).repeated().at_least(1)).map(|_| ' '),
-        ))
-            .repeated()
-            .then_ignore(just('"'))
-            .map(|val| val.into_iter().collect::<String>().into())
-            .map_err_with_span(|e: Error<S>, span| {
-                if matches!(
-                    &e,
-                    Error::Unexpected {
-                        found: TokenFormat::Eoi,
-                        ..
-                    }
-                ) {
-                    e.merge(Error::Unclosed {
-                        label: "string",
-                        opened_at: span.before_start(1),
-                        opened: '"'.into(),
-                        expected_at: span.at_end(),
-                        expected: '"'.into(),
-                        found: None.into(),
-                    })
-                } else {
-                    e
-                }
-            }),
-    )
-}
-
-fn bare_ident<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
-    let sign = just('+').or(just('-'));
-    choice((
-        // unambiguous-ident
-        id_sans_sign_dig_point().chain(id_char().repeated()),
-        // signed-ident
-        sign.chain(id_sans_dig_point().chain(id_char().repeated()).or_not()),
-        // dotted-ident
-        sign.or_not().chain(just('.')).chain(id_sans_dig().chain(id_char().repeated()).or_not()),
-    ))
-    .map(|v| v.into_iter().collect())
-    .try_map(|s: String, span| match &s[..] {
-        "true" | "false" | "null" | "nan" | "inf" | "-inf" => Err(Error::Message {
-            label: Some("illegal identifier"),
-            span,
-            message: format!("`{s}` is not allowed as a bare string"),
-        }),
-        "#true" => Err(Error::Unexpected {
-            label: Some("keyword"),
-            span,
-            found: TokenFormat::Token("#true"),
-            expected: expected_kind("identifier"),
-        }),
-        "#false" => Err(Error::Unexpected {
-            label: Some("keyword"),
-            span,
-            found: TokenFormat::Token("#false"),
-            expected: expected_kind("identifier"),
-        }),
-        "#null" => Err(Error::Unexpected {
-            label: Some("keyword"),
-            span,
-            found: TokenFormat::Token("#null"),
-            expected: expected_kind("identifier"),
-        }),
-        "#nan" => Err(Error::Unexpected {
-            label: Some("keyword"),
-            span,
-            found: TokenFormat::Token("#nan"),
-            expected: expected_kind("identifier"),
-        }),
-        "#inf" => Err(Error::Unexpected {
-            label: Some("keyword"),
-            span,
-            found: TokenFormat::Token("#inf"),
-            expected: expected_kind("identifier"),
-        }),
-        "#-inf" => Err(Error::Unexpected {
-            label: Some("keyword"),
-            span,
-            found: TokenFormat::Token("#-inf"),
-            expected: expected_kind("identifier"),
-        }),
-        _ => Ok(s.into()),
-    })
-}
-
-fn ident<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
-    choice((
-        // match -123 so `-` will not be treated as an ident by backtracking
-        number().map(Err),
-        bare_ident().map(Ok),
-        string().map(Ok),
-    ))
-    // when backtracking is not already possible,
-    // throw error for numbers (mapped to `Result::Err`)
-    .try_map(|res, span| {
-        res.map_err(|_| Error::Unexpected {
-            label: Some("unexpected number"),
-            span,
-            found: TokenFormat::Kind("number"),
-            expected: expected_kind("identifier"),
-        })
-    })
-}
-
-fn keyword<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
-    choice((
-        just("#null")
-            .map_err(|e: Error<S>| e.with_expected_token("#null"))
-            .to(Literal::Null),
-        just("#true")
-            .map_err(|e: Error<S>| e.with_expected_token("#true"))
-            .to(Literal::Bool(true)),
-        just("#false")
-            .map_err(|e: Error<S>| e.with_expected_token("#false"))
-            .to(Literal::Bool(false)),
-        just("#nan")
-            .map_err(|e: Error<S>| e.with_expected_token("#nan"))
-            .to(Literal::Nan),
-        just("#inf")
-            .map_err(|e: Error<S>| e.with_expected_token("#inf"))
-            .to(Literal::Inf),
-        just("#-inf")
-            .map_err(|e: Error<S>| e.with_expected_token("#-inf"))
-            .to(Literal::NegInf),
-    ))
-}
-
-fn digit<S: Span>(radix: u32) -> impl Parser<char, char, Error = Error<S>> {
-    filter(move |c: &char| c.is_digit(radix))
-}
-
-fn digits<S: Span>(radix: u32) -> impl Parser<char, Vec<char>, Error = Error<S>> {
-    filter(move |c: &char| c == &'_' || c.is_digit(radix)).repeated()
-}
-
-fn decimal_number<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
-    just('-')
-        .or(just('+'))
-        .or_not()
-        .chain_c(digit(10))
-        .chain_c(digits(10))
-        .chain_c(
-            just('.')
-                .chain_c(digit(10))
-                .chain_c(digits(10))
-                .or_not()
-                .flatten(),
-        )
-        .chain_c(
-            just('e')
-                .or(just('E'))
-                .chain_c(just('-').or(just('+')).or_not())
-                .chain_c(digits(10))
-                .or_not()
-                .flatten(),
-        )
-        .map(|v| {
-            let is_decimal = v.iter().any(|c| matches!(c, '.' | 'e' | 'E'));
-            let s: String = v.into_iter().filter(|c| c != &'_').collect();
-            if is_decimal {
-                Literal::Decimal(Decimal(s.into()))
-            } else {
-                Literal::Int(Integer(Radix::Dec, s.into()))
-            }
-        })
-}
-
-fn radix_number<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
-    just('-')
-        .or(just('+'))
-        .or_not()
-        .then_ignore(just('0'))
-        .then(choice((
-            just('b').ignore_then(digit(2).chain(digits(2)).map(|s| (Radix::Bin, s))),
-            just('o').ignore_then(digit(8).chain(digits(8)).map(|s| (Radix::Oct, s))),
-            just('x').ignore_then(digit(16).chain(digits(16)).map(|s| (Radix::Hex, s))),
-        )))
-        .map(|(sign, (radix, value))| {
-            let mut s = String::with_capacity(value.len() + sign.map_or(0, |_| 1));
-            if let Some(c) = sign {
-                s.push(c);
-            }
-            s.extend(value.into_iter().filter(|&c| c != '_'));
-            Literal::Int(Integer(radix, s.into()))
-        })
-}
-
-fn number<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
-    radix_number().or(decimal_number())
-}
-
-fn literal<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
-    choice((ident().map(Literal::String), keyword(), number()))
-}
-
-fn type_name<S: Span>() -> impl Parser<char, TypeName, Error = Error<S>> {
-    ident()
-        .delimited_by(
-            just('(').then(ws_char().repeated()),
-            ws_char().repeated().then(just(')'))
-        )
-        .map(TypeName::from_string)
-}
-
-fn spanned<T, S, P>(p: P) -> impl Parser<char, Spanned<T, S>, Error = Error<S>>
-where
-    P: Parser<char, T, Error = Error<S>>,
-    S: Span,
-{
-    p.map_with_span(|value, span| Spanned { span, value })
-}
-
-fn esc_line<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    just('\\')
-        .ignore_then(ws().repeated())
-        .ignore_then(comment().or(newline()).or(end()))
-}
-
-fn node_space<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    ws().or(esc_line())
-}
-
-fn node_terminator<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    choice((newline(), comment(), just(';').ignored(), end()))
-}
-
-enum PropOrArg<S> {
-    Prop(SpannedName<S>, Value<S>),
-    Arg(Value<S>),
-    Ignore,
-}
-
-fn type_name_value<S: Span>() -> impl Parser<char, Value<S>, Error = Error<S>> {
-    spanned(type_name().then_ignore(ws_char().repeated()))
-        .then(spanned(literal()))
-        .map(|(type_name, literal)| Value {
-            type_name: Some(type_name),
-            literal,
-        })
-}
-
-fn value<S: Span>() -> impl Parser<char, Value<S>, Error = Error<S>> {
-    type_name_value().or(spanned(literal()).map(|literal| Value {
-        type_name: None,
-        literal,
-    }))
-}
-
-fn prop_or_arg_inner<S: Span>() -> impl Parser<char, PropOrArg<S>, Error = Error<S>> {
-    use PropOrArg::*;
-    choice((
-        spanned(literal())
-            .then(
-                ws_char().repeated()
-                    .then(just('='))
-                    .then(ws_char().repeated())
-                    .ignore_then(value()).or_not()
-            )
-            .try_map(|(name, value), _| {
-                let name_span = name.span;
-                match (name.value, value) {
-                    (Literal::String(s), Some(value)) => {
-                        let name = Spanned {
-                            span: name_span,
-                            value: s,
-                        };
-                        Ok(Prop(name, value))
-                    }
-                    (Literal::Bool(_) | Literal::Null | Literal::Nan | Literal::Inf | Literal::NegInf, Some(_)) => Err(Error::Unexpected {
-                        label: Some("unexpected keyword"),
-                        span: name_span,
-                        found: TokenFormat::Kind("keyword"),
-                        expected: [TokenFormat::Kind("identifier"), TokenFormat::Kind("string")]
-                            .into_iter()
-                            .collect(),
-                    }),
-                    (Literal::Int(_) | Literal::Decimal(_), Some(_)) => {
-                        Err(Error::MessageWithHelp {
-                            label: Some("unexpected number"),
-                            span: name_span,
-                            message: "numbers cannot be used as property names".into(),
-                            help: "consider enclosing in double quotes \"..\"",
-                        })
-                    }
-                    (value, None) => Ok(Arg(Value {
-                        type_name: None,
-                        literal: Spanned {
-                            span: name_span,
-                            value,
-                        },
-                    })),
-                }
-            }),
-        spanned(bare_ident())
-            .then(
-                ws_char().repeated()
-                    .then(just('='))
-                    .then(ws_char().repeated())
-                    .ignore_then(value()).or_not()
-            )
-            .validate(|(name, value), span, emit| {
-                if value.is_none() {
-                    emit(Error::MessageWithHelp {
-                        label: Some("unexpected identifier"),
-                        span,
-                        message: "identifiers cannot be used as arguments".into(),
-                        help: "consider enclosing in double quotes \"..\"",
-                    });
-                }
-                (name, value)
-            })
-            .map(|(name, value)| {
-                if let Some(value) = value {
-                    Prop(name, value)
-                } else {
-                    // this is invalid, but we already emitted error
-                    // in validate() above, so doing a sane fallback
-                    Arg(Value {
-                        type_name: None,
-                        literal: name.map(Literal::String),
-                    })
-                }
-            }),
-        type_name_value().map(Arg),
-    ))
-}
-
-fn prop_or_arg<S: Span>() -> impl Parser<char, PropOrArg<S>, Error = Error<S>> {
-    begin_comment('-')
-        .ignore_then(line_space().repeated())
-        .ignore_then(prop_or_arg_inner())
-        .map(|_| PropOrArg::Ignore)
-        .or(prop_or_arg_inner())
-}
-
-fn line_space<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
-    newline().or(ws()).or(comment())
-}
+// Nodes
 
 fn nodes<S: Span>() -> impl Parser<char, Vec<SpannedNode<S>>, Error = Error<S>> {
     use PropOrArg::*;
@@ -706,8 +135,605 @@ fn nodes<S: Span>() -> impl Parser<char, Vec<SpannedNode<S>>, Error = Error<S>> 
     })
 }
 
-pub(crate) fn document<S: Span>() -> impl Parser<char, Document<S>, Error = Error<S>> {
-    just('\u{FEFF}').or_not().ignore_then(nodes()).then_ignore(end()).map(|nodes| Document { nodes })
+// Entries
+
+enum PropOrArg<S> {
+    Prop(SpannedName<S>, Value<S>),
+    Arg(Value<S>),
+    Ignore,
+}
+
+fn prop_or_arg<S: Span>() -> impl Parser<char, PropOrArg<S>, Error = Error<S>> {
+    begin_comment('-')
+        .ignore_then(line_space().repeated())
+        .ignore_then(prop_or_arg_inner())
+        .map(|_| PropOrArg::Ignore)
+        .or(prop_or_arg_inner())
+}
+
+fn prop_or_arg_inner<S: Span>() -> impl Parser<char, PropOrArg<S>, Error = Error<S>> {
+    use PropOrArg::*;
+    choice((
+        spanned(literal())
+            .then(
+                ws_char().repeated()
+                    .then(just('='))
+                    .then(ws_char().repeated())
+                    .ignore_then(value()).or_not()
+            )
+            .try_map(|(name, value), _| {
+                let name_span = name.span;
+                match (name.value, value) {
+                    (Literal::String(s), Some(value)) => {
+                        let name = Spanned {
+                            span: name_span,
+                            value: s,
+                        };
+                        Ok(Prop(name, value))
+                    }
+                    (Literal::Bool(_) | Literal::Null | Literal::Nan | Literal::Inf | Literal::NegInf, Some(_)) => Err(Error::Unexpected {
+                        label: Some("unexpected keyword"),
+                        span: name_span,
+                        found: TokenFormat::Kind("keyword"),
+                        expected: [TokenFormat::Kind("identifier"), TokenFormat::Kind("string")]
+                            .into_iter()
+                            .collect(),
+                    }),
+                    (Literal::Int(_) | Literal::Decimal(_), Some(_)) => {
+                        Err(Error::MessageWithHelp {
+                            label: Some("unexpected number"),
+                            span: name_span,
+                            message: "numbers cannot be used as property names".into(),
+                            help: "consider enclosing in double quotes \"..\"",
+                        })
+                    }
+                    (value, None) => Ok(Arg(Value {
+                        type_name: None,
+                        literal: Spanned {
+                            span: name_span,
+                            value,
+                        },
+                    })),
+                }
+            }),
+        spanned(identifier_string())
+            .then(
+                ws_char().repeated()
+                    .then(just('='))
+                    .then(ws_char().repeated())
+                    .ignore_then(value()).or_not()
+            )
+            .validate(|(name, value), span, emit| {
+                if value.is_none() {
+                    emit(Error::MessageWithHelp {
+                        label: Some("unexpected identifier"),
+                        span,
+                        message: "identifiers cannot be used as arguments".into(),
+                        help: "consider enclosing in double quotes \"..\"",
+                    });
+                }
+                (name, value)
+            })
+            .map(|(name, value)| {
+                if let Some(value) = value {
+                    Prop(name, value)
+                } else {
+                    // this is invalid, but we already emitted error
+                    // in validate() above, so doing a sane fallback
+                    Arg(Value {
+                        type_name: None,
+                        literal: name.map(Literal::String),
+                    })
+                }
+            }),
+        type_name_value().map(Arg),
+    ))
+}
+
+fn node_terminator<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    choice((newline(), comment(), just(';').ignored(), end()))
+}
+
+fn type_name_value<S: Span>() -> impl Parser<char, Value<S>, Error = Error<S>> {
+    spanned(type_name().then_ignore(ws_char().repeated()))
+        .then(spanned(literal()))
+        .map(|(type_name, literal)| Value {
+            type_name: Some(type_name),
+            literal,
+        })
+}
+
+fn value<S: Span>() -> impl Parser<char, Value<S>, Error = Error<S>> {
+    type_name_value().or(spanned(literal()).map(|literal| Value {
+        type_name: None,
+        literal,
+    }))
+}
+
+fn literal<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
+    choice((ident().map(Literal::String), keyword(), number()))
+}
+
+fn type_name<S: Span>() -> impl Parser<char, TypeName, Error = Error<S>> {
+    ident()
+        .delimited_by(
+            just('(').then(ws_char().repeated()),
+            ws_char().repeated().then(just(')'))
+        )
+        .map(TypeName::from_string)
+}
+
+// String
+
+fn ident<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
+    choice((
+        // match -123 so `-` will not be treated as an ident by backtracking
+        number().map(Err),
+        identifier_string().map(Ok),
+        string().map(Ok),
+    ))
+    // when backtracking is not already possible,
+    // throw error for numbers (mapped to `Result::Err`)
+    .try_map(|res, span| {
+        res.map_err(|_| Error::Unexpected {
+            label: Some("unexpected number"),
+            span,
+            found: TokenFormat::Kind("number"),
+            expected: expected_kind("identifier"),
+        })
+    })
+}
+
+fn string<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
+    raw_string().or(quoted_string())
+}
+
+fn identifier_string<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
+    let sign = just('+').or(just('-'));
+    choice((
+        // unambiguous-ident
+        id_sans_sign_dig_point().chain(id_char().repeated()),
+        // signed-ident
+        sign.chain(id_sans_dig_point().chain(id_char().repeated()).or_not()),
+        // dotted-ident
+        sign.or_not().chain(just('.')).chain(id_sans_dig().chain(id_char().repeated()).or_not()),
+    ))
+    .map(|v| v.into_iter().collect())
+    .try_map(|s: String, span| match &s[..] {
+        "true" | "false" | "null" | "nan" | "inf" | "-inf" => Err(Error::Message {
+            label: Some("illegal identifier"),
+            span,
+            message: format!("`{s}` is not allowed as a bare string"),
+        }),
+        "#true" => Err(Error::Unexpected {
+            label: Some("keyword"),
+            span,
+            found: TokenFormat::Token("#true"),
+            expected: expected_kind("identifier"),
+        }),
+        "#false" => Err(Error::Unexpected {
+            label: Some("keyword"),
+            span,
+            found: TokenFormat::Token("#false"),
+            expected: expected_kind("identifier"),
+        }),
+        "#null" => Err(Error::Unexpected {
+            label: Some("keyword"),
+            span,
+            found: TokenFormat::Token("#null"),
+            expected: expected_kind("identifier"),
+        }),
+        "#nan" => Err(Error::Unexpected {
+            label: Some("keyword"),
+            span,
+            found: TokenFormat::Token("#nan"),
+            expected: expected_kind("identifier"),
+        }),
+        "#inf" => Err(Error::Unexpected {
+            label: Some("keyword"),
+            span,
+            found: TokenFormat::Token("#inf"),
+            expected: expected_kind("identifier"),
+        }),
+        "#-inf" => Err(Error::Unexpected {
+            label: Some("keyword"),
+            span,
+            found: TokenFormat::Token("#-inf"),
+            expected: expected_kind("identifier"),
+        }),
+        _ => Ok(s.into()),
+    })
+}
+
+fn id_char<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
+    filter(|c| {
+        !matches!(c,
+            '\u{0000}'..='\u{0021}' |
+            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
+            // whitespace, excluding 0x20
+            '\u{00a0}' | '\u{1680}' |
+            '\u{2000}'..='\u{200A}' |
+            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
+            // newline (excluding <= 0x20)
+            '\u{0085}' | '\u{2028}' | '\u{2029}'
+        )
+    })
+    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
+}
+
+fn id_sans_dig<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
+    filter(|c| {
+        !matches!(c,
+            '0'..='9' |
+            '\u{0000}'..='\u{0020}' |
+            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
+            // whitespace, excluding 0x20
+            '\u{00a0}' | '\u{1680}' |
+            '\u{2000}'..='\u{200A}' |
+            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
+            // newline (excluding <= 0x20)
+            '\u{0085}' | '\u{2028}' | '\u{2029}'
+        )
+    })
+    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
+}
+
+fn id_sans_dig_point<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
+    filter(|c| {
+        !matches!(c,
+            '0'..='9' | '.' |
+            '\u{0000}'..='\u{0020}' |
+            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
+            // whitespace, excluding 0x20
+            '\u{00a0}' | '\u{1680}' |
+            '\u{2000}'..='\u{200A}' |
+            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
+            // newline (excluding <= 0x20)
+            '\u{0085}' | '\u{2028}' | '\u{2029}'
+        )
+    })
+    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
+}
+
+fn id_sans_sign_dig_point<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
+    filter(|c| {
+        !matches!(c,
+            '-'| '+' | '0'..='9' |
+            '\u{0000}'..='\u{0020}' |
+            '\\'|'/'|'('|')'|'{'|'}'|';'|'['|']'|'='|'"'|'#' |
+            // whitespace, excluding 0x20
+            '\u{00a0}' | '\u{1680}' |
+            '\u{2000}'..='\u{200A}' |
+            '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}' |
+            // newline (excluding <= 0x20)
+            '\u{0085}' | '\u{2028}' | '\u{2029}'
+        )
+    })
+    .map_err(|e: Error<S>| e.with_expected_kind("letter"))
+}
+
+fn raw_string<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
+     just('#').repeated().at_least(1).map(|v| v.len())
+        .then_ignore(just('"'))
+        .then_with(|sharp_num| {
+            take_until(just('"').ignore_then(just('#').repeated().exactly(sharp_num).ignored()))
+                .map_err_with_span(move |e: Error<S>, span| {
+                    if matches!(
+                        &e,
+                        Error::Unexpected {
+                            found: TokenFormat::Eoi,
+                            ..
+                        }
+                    ) {
+                        e.merge(Error::Unclosed {
+                            label: "raw string",
+                            opened_at: span.before_start(sharp_num + 2),
+                            opened: TokenFormat::OpenRaw(sharp_num),
+                            expected_at: span.at_end(),
+                            expected: TokenFormat::CloseRaw(sharp_num),
+                            found: None.into(),
+                        })
+                    } else {
+                        e
+                    }
+                })
+        })
+        .map(|(text, ())| text.into_iter().collect::<String>().into())
+}
+
+fn quoted_string<S: Span>() -> impl Parser<char, Box<str>, Error = Error<S>> {
+    just('"').ignore_then(
+        choice((
+            filter(|&c| c != '"' && c != '\\'),
+            just('\\').ignore_then(esc_char()),
+            // ws-escape
+            just('\\').then(ws_char().or(newline()).repeated().at_least(1)).map(|_| ' '),
+        ))
+            .repeated()
+            .then_ignore(just('"'))
+            .map(|val| val.into_iter().collect::<String>().into())
+            .map_err_with_span(|e: Error<S>, span| {
+                if matches!(
+                    &e,
+                    Error::Unexpected {
+                        found: TokenFormat::Eoi,
+                        ..
+                    }
+                ) {
+                    e.merge(Error::Unclosed {
+                        label: "string",
+                        opened_at: span.before_start(1),
+                        opened: '"'.into(),
+                        expected_at: span.at_end(),
+                        expected: '"'.into(),
+                        found: None.into(),
+                    })
+                } else {
+                    e
+                }
+            }),
+    )
+}
+
+// Numbers
+
+fn number<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
+    radix_number().or(decimal_number())
+}
+
+fn decimal_number<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
+    just('-')
+        .or(just('+'))
+        .or_not()
+        .chain_c(digit(10))
+        .chain_c(digits(10))
+        .chain_c(
+            just('.')
+                .chain_c(digit(10))
+                .chain_c(digits(10))
+                .or_not()
+                .flatten(),
+        )
+        .chain_c(
+            just('e')
+                .or(just('E'))
+                .chain_c(just('-').or(just('+')).or_not())
+                .chain_c(digits(10))
+                .or_not()
+                .flatten(),
+        )
+        .map(|v| {
+            let is_decimal = v.iter().any(|c| matches!(c, '.' | 'e' | 'E'));
+            let s: String = v.into_iter().filter(|c| c != &'_').collect();
+            if is_decimal {
+                Literal::Decimal(Decimal(s.into()))
+            } else {
+                Literal::Int(Integer(Radix::Dec, s.into()))
+            }
+        })
+}
+
+fn digits<S: Span>(radix: u32) -> impl Parser<char, Vec<char>, Error = Error<S>> {
+    filter(move |c: &char| c == &'_' || c.is_digit(radix)).repeated()
+}
+
+fn digit<S: Span>(radix: u32) -> impl Parser<char, char, Error = Error<S>> {
+    filter(move |c: &char| c.is_digit(radix))
+}
+
+fn radix_number<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
+    just('-')
+        .or(just('+'))
+        .or_not()
+        .then_ignore(just('0'))
+        .then(choice((
+            just('b').ignore_then(digit(2).chain(digits(2)).map(|s| (Radix::Bin, s))),
+            just('o').ignore_then(digit(8).chain(digits(8)).map(|s| (Radix::Oct, s))),
+            just('x').ignore_then(digit(16).chain(digits(16)).map(|s| (Radix::Hex, s))),
+        )))
+        .map(|(sign, (radix, value))| {
+            let mut s = String::with_capacity(value.len() + sign.map_or(0, |_| 1));
+            if let Some(c) = sign {
+                s.push(c);
+            }
+            s.extend(value.into_iter().filter(|&c| c != '_'));
+            Literal::Int(Integer(radix, s.into()))
+        })
+}
+
+// Keywords and booleans
+
+fn keyword<S: Span>() -> impl Parser<char, Literal, Error = Error<S>> {
+    choice((
+        just("#null")
+            .map_err(|e: Error<S>| e.with_expected_token("#null"))
+            .to(Literal::Null),
+        just("#true")
+            .map_err(|e: Error<S>| e.with_expected_token("#true"))
+            .to(Literal::Bool(true)),
+        just("#false")
+            .map_err(|e: Error<S>| e.with_expected_token("#false"))
+            .to(Literal::Bool(false)),
+        just("#nan")
+            .map_err(|e: Error<S>| e.with_expected_token("#nan"))
+            .to(Literal::Nan),
+        just("#inf")
+            .map_err(|e: Error<S>| e.with_expected_token("#inf"))
+            .to(Literal::Inf),
+        just("#-inf")
+            .map_err(|e: Error<S>| e.with_expected_token("#-inf"))
+            .to(Literal::NegInf),
+    ))
+}
+
+// Specific code points
+
+fn ws_char<S: Span>() -> impl Parser<char, (), Error = Error<S>> + Clone {
+    filter(|c| {
+        matches!(
+            c,
+            '\t' | ' ' | '\u{00a0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+        )
+    })
+    .ignored()
+}
+
+fn esc_char<S: Span>() -> impl Parser<char, char, Error = Error<S>> {
+    filter_map(|span, c| match c {
+        '"' | '\\' => Ok(c),
+        'b' => Ok('\u{0008}'),
+        'f' => Ok('\u{000C}'),
+        'n' => Ok('\n'),
+        'r' => Ok('\r'),
+        't' => Ok('\t'),
+        's' => Ok(' '),
+        c => Err(Error::Unexpected {
+            label: Some("invalid escape char"),
+            span,
+            found: c.into(),
+            expected: "\"\\bfnrts".chars().map(|c| c.into()).collect(),
+        }),
+    })
+    .or(just('u').ignore_then(
+        filter_map(|span, c: char| {
+            c.is_ascii_hexdigit()
+                .then_some(c)
+                .ok_or_else(|| Error::Unexpected {
+                    label: Some("unexpected character"),
+                    span,
+                    found: c.into(),
+                    expected: expected_kind("hexadecimal digit"),
+                })
+        })
+        .repeated()
+        .at_least(1)
+        .at_most(6)
+        .delimited_by(just('{'), just('}'))
+        .try_map(|hex_chars, span| {
+            let s = hex_chars.into_iter().collect::<String>();
+            let c = u32::from_str_radix(&s, 16)
+                .map_err(|e| e.to_string())
+                .and_then(|n| char::try_from(n).map_err(|e| e.to_string()))
+                .map_err(|e| Error::Message {
+                    label: Some("invalid character code"),
+                    span,
+                    message: e.to_string(),
+                })?;
+            Ok(c)
+        })
+        .recover_with(skip_until(['}', '"', '\\'], |_| '\0')),
+    ))
+}
+
+fn spanned<T, S, P>(p: P) -> impl Parser<char, Spanned<T, S>, Error = Error<S>>
+where
+    P: Parser<char, T, Error = Error<S>>,
+    S: Span,
+{
+    p.map_with_span(|value, span| Spanned { span, value })
+}
+
+// Comments
+
+fn comment<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    begin_comment('/')
+        .then(take_until(newline().or(end())))
+        .ignored()
+}
+
+fn ml_comment<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    recursive::<_, _, _, _, Error<S>>(|comment| {
+        choice((
+            comment,
+            none_of('*').ignored(),
+            just('*').then_ignore(none_of('/').rewind()).ignored(),
+        ))
+        .repeated()
+        .ignored()
+        .delimited_by(begin_comment('*'), just("*/"))
+    })
+    .map_err_with_span(|e, span| {
+        if matches!(
+            &e,
+            Error::Unexpected {
+                found: TokenFormat::Eoi,
+                ..
+            }
+        ) && span.length() > 2
+        {
+            e.merge(Error::Unclosed {
+                label: "comment",
+                opened_at: span.at_start(2),
+                opened: "/*".into(),
+                expected_at: span.at_end(),
+                expected: "*/".into(),
+                found: None.into(),
+            })
+        } else {
+            // otherwise opening /* is not matched
+            e
+        }
+    })
+}
+
+fn begin_comment<S: Span>(which: char) -> impl Parser<char, (), Error = Error<S>> + Clone {
+    just('/')
+        .map_err(|e: Error<S>| e.with_no_expected())
+        .ignore_then(just(which).ignored())
+}
+
+// Whitespace
+
+fn ws<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    ws_char()
+        .repeated()
+        .at_least(1)
+        .ignored()
+        .or(ml_comment())
+        .map_err(|e| e.with_expected_kind("whitespace"))
+}
+
+fn esc_line<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    just('\\')
+        .ignore_then(ws().repeated())
+        .ignore_then(comment().or(newline()).or(end()))
+}
+
+fn newline<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    just('\r')
+        .or_not()
+        .ignore_then(just('\n'))
+        .or(just('\r')) // Carriage return
+        .or(just('\x0C')) // Form feed
+        .or(just('\x0B')) // Vertical tab
+        .or(just('\u{0085}')) // Next line
+        .or(just('\u{2028}')) // Line separator
+        .or(just('\u{2029}')) // Paragraph separator
+        .ignored()
+        .map_err(|e: Error<S>| e.with_expected_kind("newline"))
+}
+
+// Whitespace where newlines are allowed
+
+fn line_space<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    newline().or(ws()).or(comment())
+}
+
+// Whitespace within nodes
+
+fn node_space<S: Span>() -> impl Parser<char, (), Error = Error<S>> {
+    ws().or(esc_line())
+}
+
+// Version marker
+
+// TODO
+
+// Other
+
+fn expected_kind(s: &'static str) -> BTreeSet<TokenFormat> {
+    [TokenFormat::Kind(s)].into_iter().collect()
 }
 
 #[cfg(test)]
@@ -729,8 +755,7 @@ mod test {
                 serde_json::from_str($right).unwrap();
             assert_json_diff::assert_json_include!(
                 actual: left, expected: right);
-            //assert_json_diff::assert_json_eq!(left, right);
-        }
+            //assert_json_diff::assert_json_eq!(left, right);r        }
     }
 
     fn parse<P, T>(p: P, text: &str) -> Result<T, String>
